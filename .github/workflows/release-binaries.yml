@@ -1,0 +1,140 @@
+name: release-binaries
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: codex-rs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+            binaries: codex
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar
+            binaries: codex
+          - name: macos-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar
+            binaries: codex
+          - name: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            archive: tar
+            binaries: codex
+          - name: windows-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            binaries: codex
+          - name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+            binaries: codex
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.93.0 --profile minimal
+          rustup target add --toolchain 1.93.0 ${{ matrix.target }}
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_args=()
+          for binary in ${{ matrix.binaries }}; do
+            build_args+=(--bin "$binary")
+          done
+          cargo build --locked --release --target ${{ matrix.target }} "${build_args[@]}"
+
+      - name: Stage Unix archive
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="codex-${{ matrix.target }}"
+          package_root="${RUNNER_TEMP}/${package}"
+          rm -rf "$package_root"
+          mkdir -p "$package_root/bin"
+
+          for binary in ${{ matrix.binaries }}; do
+            cp "target/${{ matrix.target }}/release/${binary}" "$package_root/bin/${binary}"
+          done
+
+          cat > "$package_root/INSTALL.txt" <<'EOF'
+          Add this package's bin directory to PATH, or copy the binaries from bin/ into a directory already on PATH.
+          EOF
+
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+          (cd "${RUNNER_TEMP}" && tar -czf "${GITHUB_WORKSPACE}/dist/${package}.tar.gz" "$package")
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${GITHUB_WORKSPACE}/dist/${package}.tar.gz" > "${GITHUB_WORKSPACE}/dist/${package}.tar.gz.sha256"
+          else
+            sha256sum "${GITHUB_WORKSPACE}/dist/${package}.tar.gz" > "${GITHUB_WORKSPACE}/dist/${package}.tar.gz.sha256"
+          fi
+
+      - name: Stage Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = "codex-${{ matrix.target }}"
+          $packageRoot = Join-Path $env:RUNNER_TEMP $package
+          Remove-Item -Recurse -Force $packageRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force (Join-Path $packageRoot "bin") | Out-Null
+
+          foreach ($binary in "${{ matrix.binaries }}".Split(" ")) {
+            Copy-Item "target/${{ matrix.target }}/release/$binary.exe" (Join-Path $packageRoot "bin/$binary.exe")
+          }
+
+          @"
+          Add this package's bin directory to PATH, or copy the binaries from bin\ into a directory already on PATH.
+          "@ | Set-Content -Encoding UTF8 (Join-Path $packageRoot "INSTALL.txt")
+
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          $archive = Join-Path $dist "$package.zip"
+          Compress-Archive -Path $packageRoot -DestinationPath $archive -Force
+          $hash = Get-FileHash -Algorithm SHA256 $archive
+          "$($hash.Hash.ToLowerInvariant())  $package.zip" | Set-Content -Encoding ascii "$archive.sha256"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-${{ matrix.target }}
+          path: |
+            dist/*
+          if-no-files-found: error
